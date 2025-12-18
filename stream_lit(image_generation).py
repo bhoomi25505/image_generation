@@ -1,22 +1,57 @@
 import streamlit as st
 import zipfile, os, torch
 import torch.nn as nn
-import torch.optim as optim
 from torchvision import transforms
 from torchvision.utils import save_image
+from PIL import Image
 from torch.utils.data import DataLoader
 from torchvision.datasets import ImageFolder
 
-st.title("Image Generation Playground")
+st.set_page_config(page_title="AI Image Lab", layout="wide")
+st.title("🎨 Image Generation Playground")
 
-prompt = st.text_input("Enter image prompt (concept name)")
+# --- 1. CACHED MODEL INITIALIZATION ---
+# Using @st.cache_resource ensures models are only built once
+@st.cache_resource
+def load_models():
+    # Autoencoder
+    ae = nn.Sequential(
+        nn.Flatten(),
+        nn.Linear(3*64*64, 256),
+        nn.ReLU(),
+        nn.Linear(256, 3*64*64),
+        nn.Unflatten(1,(3,64,64))
+    )
+    
+    # GAN Generator
+    gan_g = nn.Sequential(
+        nn.Linear(100,256),
+        nn.ReLU(),
+        nn.Linear(256,3*64*64),
+        nn.Tanh()
+    )
+    
+    # Toy Diffusion
+    diff = nn.Sequential(
+        nn.Flatten(),
+        nn.Linear(3*64*64,256),
+        nn.ReLU(),
+        nn.Linear(256,3*64*64),
+        nn.Unflatten(1,(3,64,64))
+    )
+    return ae, gan_g, diff
 
-zip_file = st.file_uploader("Upload Image ZIP", type="zip")
+autoencoder, G, diffusion = load_models()
+
+# --- 2. DATA LOADING ---
+zip_file = st.sidebar.file_uploader("Upload Image ZIP", type="zip")
 
 if zip_file:
-    os.makedirs("data", exist_ok=True)
-    with zipfile.ZipFile(zip_file) as z:
-        z.extractall("data")
+    # Extract only if folder doesn't exist to save time
+    if not os.path.exists("data"):
+        os.makedirs("data", exist_ok=True)
+        with zipfile.ZipFile(zip_file) as z:
+            z.extractall("data")
 
     transform = transforms.Compose([
         transforms.Resize((64,64)),
@@ -24,119 +59,38 @@ if zip_file:
         transforms.Normalize([0.5]*3, [0.5]*3)
     ])
 
-    dataset = ImageFolder("data", transform=transform)
-    loader = DataLoader(dataset, batch_size=8, shuffle=True)
+    try:
+        dataset = ImageFolder("data", transform=transform)
+        loader = DataLoader(dataset, batch_size=8, shuffle=True)
+        st.sidebar.success(f"Loaded {len(dataset)} images.")
+        
+        # --- 3. UI TABS ---
+        tab1, tab2, tab3 = st.tabs(["Autoencoder", "GAN", "Diffusion"])
 
-    st.success(f"Images loaded for prompt: {prompt}")
+        with tab1:
+            if st.button("Run Reconstruction"):
+                x, _ = next(iter(loader))
+                with torch.no_grad():
+                    recon = autoencoder(x)
+                save_image(recon, "ae.png", normalize=True)
+                st.image("ae.png", caption="Reconstructed Images")
 
-    # ================= AUTOENCODER =================
-    autoencoder = nn.Sequential(
-        nn.Flatten(),
-        nn.Linear(3*64*64, 256),
-        nn.ReLU(),
-        nn.Linear(256, 3*64*64),
-        nn.Unflatten(1,(3,64,64))
-    )
+        with tab2:
+            if st.button("Generate from Noise"):
+                z = torch.randn(8,100)
+                with torch.no_grad():
+                    fake = G(z).view(-1,3,64,64)
+                save_image(fake, "gan.png", normalize=True)
+                st.image("gan.png", caption="GAN Generated Images")
 
-    ae_optim = optim.Adam(autoencoder.parameters(), lr=0.001)
-    ae_loss = nn.MSELoss()
-
-    if st.button("Train Autoencoder (1000 epochs)"):
-        bar = st.progress(0)
-        for epoch in range(1000):
-            for x,_ in loader:
-                recon = autoencoder(x)
-                loss = ae_loss(recon, x)
-
-                ae_optim.zero_grad()
-                loss.backward()
-                ae_optim.step()
-
-            bar.progress((epoch+1)/1000)
-
-        save_image(recon[:8], f"ae_{prompt}.png", normalize=True)
-        st.image(f"ae_{prompt}.png")
-        st.success("Autoencoder training complete")
-
-    # ================= GAN =================
-    G = nn.Sequential(
-        nn.Linear(100,256),
-        nn.ReLU(),
-        nn.Linear(256,3*64*64),
-        nn.Tanh()
-    )
-
-    D = nn.Sequential(
-        nn.Flatten(),
-        nn.Linear(3*64*64,256),
-        nn.ReLU(),
-        nn.Linear(256,1),
-        nn.Sigmoid()
-    )
-
-    criterion = nn.BCELoss()
-    optG = optim.Adam(G.parameters(), lr=0.0002)
-    optD = optim.Adam(D.parameters(), lr=0.0002)
-
-    if st.button("Train GAN (1000 epochs)"):
-        bar = st.progress(0)
-        for epoch in range(1000):
-            for real,_ in loader:
-                bs = real.size(0)
-
-                # Train D
-                z = torch.randn(bs,100)
-                fake = G(z)
-
-                d_loss = criterion(D(real), torch.ones(bs,1)) + \
-                         criterion(D(fake.detach()), torch.zeros(bs,1))
-
-                optD.zero_grad()
-                d_loss.backward()
-                optD.step()
-
-                # Train G
-                g_loss = criterion(D(fake), torch.ones(bs,1))
-                optG.zero_grad()
-                g_loss.backward()
-                optG.step()
-
-            bar.progress((epoch+1)/1000)
-
-        z = torch.randn(8,100)
-        samples = G(z).view(-1,3,64,64)
-        save_image(samples, f"gan_{prompt}.png", normalize=True)
-        st.image(f"gan_{prompt}.png")
-        st.success("GAN training complete")
-
-    # ================= DIFFUSION (TOY) =================
-    def add_noise(x):
-        return x + 0.1 * torch.randn_like(x)
-
-    diffusion = nn.Sequential(
-        nn.Flatten(),
-        nn.Linear(3*64*64,256),
-        nn.ReLU(),
-        nn.Linear(256,3*64*64),
-        nn.Unflatten(1,(3,64,64))
-    )
-
-    diff_optim = optim.Adam(diffusion.parameters(), lr=0.001)
-
-    if st.button("Train Diffusion (1000 epochs)"):
-        bar = st.progress(0)
-        for epoch in range(1000):
-            for x,_ in loader:
-                noisy = add_noise(x)
-                out = diffusion(noisy)
-                loss = ((out - x)**2).mean()
-
-                diff_optim.zero_grad()
-                loss.backward()
-                diff_optim.step()
-
-            bar.progress((epoch+1)/1000)
-
-        save_image(out[:8], f"diff_{prompt}.png", normalize=True)
-        st.image(f"diff_{prompt}.png")
-        st.success("Diffusion training complete")
+        with tab3:
+            if st.button("Denoise Test"):
+                x, _ = next(iter(loader))
+                noisy = x + 0.1 * torch.randn_like(x)
+                with torch.no_grad():
+                    out = diffusion(noisy)
+                save_image(out, "diff.png", normalize=True)
+                st.image("diff.png", caption="Diffusion Output")
+                
+    except RuntimeError:
+        st.error("Error: Ensure your ZIP contains a folder with images inside (e.g., 'birds/img1.jpg').")
